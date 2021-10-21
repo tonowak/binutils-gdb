@@ -310,9 +310,6 @@ do_initial_child_stuff (HANDLE proch, DWORD pid, int attached)
 
   windows_process.open_process_used = true;
 
-  memset (&windows_process.current_event, 0,
-	  sizeof (windows_process.current_event));
-
 #ifdef __x86_64__
   BOOL wow64;
   if (!IsWow64Process (proch, &wow64))
@@ -624,7 +621,8 @@ win32_process_target::attach (unsigned long pid)
 
 DWORD
 gdbserver_windows_process::handle_output_debug_string
-     (struct target_waitstatus *ourstatus)
+  (const DEBUG_EVENT &current_event,
+   struct target_waitstatus *ourstatus)
 {
 #define READ_BUFFER_LEN 1024
   CORE_ADDR addr;
@@ -693,14 +691,13 @@ win32_process_target::kill (process_info *process)
     {
       if (!child_continue_for_kill (DBG_CONTINUE, -1))
 	break;
-      if (!wait_for_debug_event (&windows_process.current_event, INFINITE))
+      DEBUG_EVENT current_event;
+      if (!wait_for_debug_event (&current_event, INFINITE))
 	break;
-      if (windows_process.current_event.dwDebugEventCode
-	  == EXIT_PROCESS_DEBUG_EVENT)
+      if (current_event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
 	break;
-      else if (windows_process.current_event.dwDebugEventCode
-	       == OUTPUT_DEBUG_STRING_EVENT)
-	windows_process.handle_output_debug_string (nullptr);
+      else if (current_event.dwDebugEventCode == OUTPUT_DEBUG_STRING_EVENT)
+	windows_process.handle_output_debug_string (current_event, nullptr);
     }
 
   win32_clear_inferiors ();
@@ -774,8 +771,7 @@ resume_one_thread (thread_info *thread, bool step, gdb_signal sig,
 	  OUTMSG (("Cannot continue with signal %d here.  "
 		   "Not last-event thread", sig));
 	}
-      else if (windows_process.current_event.dwDebugEventCode
-	       != EXCEPTION_DEBUG_EVENT)
+      else if (th->last_event.dwDebugEventCode != EXCEPTION_DEBUG_EVENT)
 	{
 	  OUTMSG (("Cannot continue with signal %s here.  "
 		   "Not stopped for EXCEPTION_DEBUG_EVENT.\n",
@@ -920,7 +916,7 @@ gdbserver_windows_process::handle_load_dll (const char *name, LPVOID base)
 /* See nat/windows-nat.h.  */
 
 void
-gdbserver_windows_process::handle_unload_dll ()
+gdbserver_windows_process::handle_unload_dll (const DEBUG_EVENT &current_event)
 {
   CORE_ADDR load_addr =
 	  (CORE_ADDR) (uintptr_t) current_event.u.UnloadDll.lpBaseOfDll;
@@ -954,7 +950,7 @@ gdbserver_windows_process::handle_access_violation
    PC.  */
 
 static void
-maybe_adjust_pc ()
+maybe_adjust_pc (const DEBUG_EVENT &current_event)
 {
   struct regcache *regcache = get_thread_regcache (current_thread, 1);
   child_fetch_inferior_registers (regcache, -1);
@@ -963,10 +959,10 @@ maybe_adjust_pc ()
     = windows_process.find_thread (current_thread_ptid ());
   th->stopped_at_software_breakpoint = false;
 
-  if (windows_process.current_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
-      && ((windows_process.current_event.u.Exception.ExceptionRecord.ExceptionCode
+  if (current_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+      && ((current_event.u.Exception.ExceptionRecord.ExceptionCode
 	   == EXCEPTION_BREAKPOINT)
-	  || (windows_process.current_event.u.Exception.ExceptionRecord.ExceptionCode
+	  || (current_event.u.Exception.ExceptionRecord.ExceptionCode
 	      == STATUS_WX86_BREAKPOINT))
       && windows_process.child_initialization_done)
     {
@@ -981,7 +977,8 @@ maybe_adjust_pc ()
 
 static int
 get_child_debug_event (DWORD *continue_status,
-		       struct target_waitstatus *ourstatus)
+		       struct target_waitstatus *ourstatus,
+		       DEBUG_EVENT *current_event)
 {
   ptid_t ptid;
 
@@ -991,8 +988,6 @@ get_child_debug_event (DWORD *continue_status,
 
   /* Check if GDB sent us an interrupt request.  */
   check_remote_input_interrupt_request ();
-
-  DEBUG_EVENT *current_event = &windows_process.current_event;
 
   windows_process.attaching = 0;
   {
@@ -1005,8 +1000,8 @@ get_child_debug_event (DWORD *continue_status,
 	  {
 	    *ourstatus = th->pending_stop.status;
 	    th->pending_stop.status.set_ignore ();
-	    windows_process.current_event = th->pending_stop.event;
-	    ptid = debug_event_ptid (&windows_process.current_event);
+	    *current_event = th->last_event;
+	    ptid = debug_event_ptid (current_event);
 	    switch_to_thread (find_thread_ptid (ptid));
 	    return 1;
 	  }
@@ -1015,7 +1010,7 @@ get_child_debug_event (DWORD *continue_status,
     /* Keep the wait time low enough for comfortable remote
        interruption, but high enough so gdbserver doesn't become a
        bottleneck.  */
-    if (!wait_for_debug_event (&windows_process.current_event, 250))
+    if (!wait_for_debug_event (current_event, 250))
       {
 	DWORD e  = GetLastError();
 
@@ -1110,7 +1105,7 @@ get_child_debug_event (DWORD *continue_status,
       CloseHandle (current_event->u.LoadDll.hFile);
       if (! windows_process.child_initialization_done)
 	break;
-      windows_process.dll_loaded_event ();
+      windows_process.dll_loaded_event (*current_event);
 
       ourstatus->set_loaded ();
       break;
@@ -1122,7 +1117,7 @@ get_child_debug_event (DWORD *continue_status,
 		(unsigned) current_event->dwThreadId));
       if (! windows_process.child_initialization_done)
 	break;
-      windows_process.handle_unload_dll ();
+      windows_process.handle_unload_dll (*current_event);
       ourstatus->set_loaded ();
       break;
 
@@ -1131,7 +1126,8 @@ get_child_debug_event (DWORD *continue_status,
 		"for pid=%u tid=%x\n",
 		(unsigned) current_event->dwProcessId,
 		(unsigned) current_event->dwThreadId));
-      if (windows_process.handle_exception (ourstatus, debug_threads)
+      if (windows_process.handle_exception (*current_event,
+					    ourstatus, debug_threads)
 	  == HANDLE_EXCEPTION_UNHANDLED)
 	*continue_status = DBG_EXCEPTION_NOT_HANDLED;
       break;
@@ -1142,7 +1138,7 @@ get_child_debug_event (DWORD *continue_status,
 		"for pid=%u tid=%x\n",
 		(unsigned) current_event->dwProcessId,
 		(unsigned) current_event->dwThreadId));
-      windows_process.handle_output_debug_string (nullptr);
+      windows_process.handle_output_debug_string (*current_event, nullptr);
       break;
 
     default:
@@ -1154,9 +1150,11 @@ get_child_debug_event (DWORD *continue_status,
       break;
     }
 
-  ptid = debug_event_ptid (&windows_process.current_event);
+  ptid = debug_event_ptid (current_event);
 
   windows_thread_info *th = windows_process.find_thread (ptid);
+
+  th->last_event = *current_event;
 
   if (th != nullptr && th->suspended)
     {
@@ -1166,9 +1164,8 @@ get_child_debug_event (DWORD *continue_status,
       OUTMSG2 (("get_windows_debug_event - "
 		"unexpected stop in suspended thread 0x%x\n",
 		th->tid));
-      maybe_adjust_pc ();
+      maybe_adjust_pc (*current_event);
       th->pending_stop.status = *ourstatus;
-      th->pending_stop.event = *current_event;
       ourstatus->set_spurious ();
     }
   else
@@ -1192,13 +1189,16 @@ win32_process_target::wait (ptid_t ptid, target_waitstatus *ourstatus,
 	 fails).  Report it now.  */
       *ourstatus = windows_process.cached_status;
       windows_process.cached_status.set_ignore ();
-      return debug_event_ptid (&windows_process.current_event);
+      return ptid_t (windows_process.process_id,
+		     windows_process.main_thread_id, 0);
     }
 
   while (1)
     {
       DWORD continue_status;
-      if (!get_child_debug_event (&continue_status, ourstatus))
+      DEBUG_EVENT current_event;
+      if (!get_child_debug_event (&continue_status, ourstatus,
+				  &current_event))
 	continue;
 
       switch (ourstatus->kind ())
@@ -1207,20 +1207,20 @@ win32_process_target::wait (ptid_t ptid, target_waitstatus *ourstatus,
 	  OUTMSG2 (("Child exited with retcode = %x\n",
 		    ourstatus->exit_status ()));
 	  win32_clear_inferiors ();
-	  return ptid_t (windows_process.current_event.dwProcessId);
+	  return ptid_t (windows_process.process_id);
 	case TARGET_WAITKIND_STOPPED:
 	case TARGET_WAITKIND_SIGNALLED:
 	case TARGET_WAITKIND_LOADED:
 	  {
 	    OUTMSG2 (("Child Stopped with signal = %d \n",
 		      ourstatus->sig ()));
-	    maybe_adjust_pc ();
+	    maybe_adjust_pc (current_event);
 
 	    /* All-stop, suspend all threads until they are explicitly
 	       resumed.  */
 	    for_each_thread (suspend_one_thread);
 
-	    return debug_event_ptid (&windows_process.current_event);
+	    return debug_event_ptid (&current_event);
 	  }
 	default:
 	  OUTMSG (("Ignoring unknown internal event, %d\n",
