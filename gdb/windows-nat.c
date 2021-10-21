@@ -355,6 +355,12 @@ private:
      needed.  */
   void wait_for_debug_event_main_thread (DEBUG_EVENT *event);
 
+  /* This continues the last debug event, dispatching to the worker
+     thread as needed.  */
+  void continue_last_debug_event_main_thread (const char *context_str,
+					      DWORD continue_status,
+					      bool last_call = false);
+
   /* Queue used to send requests to process_thread.  This is
      implicitly locked.  */
   std::queue<gdb::function_view<bool ()>> m_queue;
@@ -1297,20 +1303,9 @@ windows_nat_target::windows_continue (DWORD continue_status, int id,
 	th->resume ();
       }
 
-  gdb::optional<unsigned> err;
-  do_synchronously ([&] ()
-    {
-      if (!continue_last_debug_event (continue_status, debug_events))
-	err = (unsigned) GetLastError ();
-      /* On the last call, do not block waiting for an event that will
-	 never come.  */
-      return !last_call;
-    });
-
-  if (err.has_value ())
-    error (_("Failed to resume program execution"
-	     " (ContinueDebugEvent failed, error %u: %s)"),
-	   *err, strwinerror (*err));
+  continue_last_debug_event_main_thread
+    (_("Failed to resume program execution"), continue_status,
+     last_call);
 
   return TRUE;
 }
@@ -2800,6 +2795,25 @@ windows_xfer_memory (gdb_byte *readbuf, const gdb_byte *writebuf,
     return TARGET_XFER_OK;
   else
     return success ? TARGET_XFER_OK : TARGET_XFER_E_IO;
+}
+
+void
+windows_nat_target::continue_last_debug_event_main_thread
+  (const char *context_str, DWORD continue_status, bool last_call)
+{
+  gdb::optional<unsigned> err;
+  do_synchronously ([&] ()
+    {
+      if (!continue_last_debug_event (continue_status, debug_events))
+	err = (unsigned) GetLastError ();
+
+      /* On the last call, do not block waiting for an event that will
+	 never come.  */
+      return !last_call;
+    });
+  if (err.has_value ())
+    error (_("%s (ContinueDebugEvent failed, error %u: %s)"),
+	   context_str, *err, strwinerror (*err));
 }
 
 void
