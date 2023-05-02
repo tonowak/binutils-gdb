@@ -102,8 +102,6 @@ struct windows_per_inferior : public windows_process_info
   int have_saved_context = 0;	/* True if we've saved context from a
 				   cygwin signal.  */
 
-  uintptr_t dr[8] {};
-
   int windows_initialization_done = 0;
 
   std::vector<std::unique_ptr<windows_thread_info>> thread_list;
@@ -748,36 +746,12 @@ windows_nat_target::fetch_registers (struct regcache *regcache, int r)
 	{
 	  th->wow64_context.ContextFlags = CONTEXT_DEBUGGER_DR;
 	  CHECK (Wow64GetThreadContext (th->h, &th->wow64_context));
-	  /* Copy dr values from that thread.
-	     But only if there were not modified since last stop.
-	     PR gdb/2388 */
-	  if (!th->debug_registers_changed)
-	    {
-	      windows_process.dr[0] = th->wow64_context.Dr0;
-	      windows_process.dr[1] = th->wow64_context.Dr1;
-	      windows_process.dr[2] = th->wow64_context.Dr2;
-	      windows_process.dr[3] = th->wow64_context.Dr3;
-	      windows_process.dr[6] = th->wow64_context.Dr6;
-	      windows_process.dr[7] = th->wow64_context.Dr7;
-	    }
 	}
       else
 #endif
 	{
 	  th->context.ContextFlags = CONTEXT_DEBUGGER_DR;
 	  CHECK (GetThreadContext (th->h, &th->context));
-	  /* Copy dr values from that thread.
-	     But only if there were not modified since last stop.
-	     PR gdb/2388 */
-	  if (!th->debug_registers_changed)
-	    {
-	      windows_process.dr[0] = th->context.Dr0;
-	      windows_process.dr[1] = th->context.Dr1;
-	      windows_process.dr[2] = th->context.Dr2;
-	      windows_process.dr[3] = th->context.Dr3;
-	      windows_process.dr[6] = th->context.Dr6;
-	      windows_process.dr[7] = th->context.Dr7;
-	    }
 	}
       th->reload_context = false;
     }
@@ -1275,18 +1249,21 @@ windows_nat_target::windows_continue (DWORD continue_status, int id,
   for (auto &th : windows_process.thread_list)
     if (id == -1 || id == (int) th->tid)
       {
+	struct x86_debug_reg_state *state
+	  = x86_debug_reg_state (windows_process.process_id);
+
 #ifdef __x86_64__
 	if (windows_process.wow64_process)
 	  {
 	    if (th->debug_registers_changed)
 	      {
 		th->wow64_context.ContextFlags |= CONTEXT_DEBUG_REGISTERS;
-		th->wow64_context.Dr0 = windows_process.dr[0];
-		th->wow64_context.Dr1 = windows_process.dr[1];
-		th->wow64_context.Dr2 = windows_process.dr[2];
-		th->wow64_context.Dr3 = windows_process.dr[3];
+		th->wow64_context.Dr0 = state->dr_mirror[0];
+		th->wow64_context.Dr1 = state->dr_mirror[1];
+		th->wow64_context.Dr2 = state->dr_mirror[2];
+		th->wow64_context.Dr3 = state->dr_mirror[3];
 		th->wow64_context.Dr6 = DR6_CLEAR_VALUE;
-		th->wow64_context.Dr7 = windows_process.dr[7];
+		th->wow64_context.Dr7 = state->dr_control_mirror;
 		th->debug_registers_changed = false;
 	      }
 	    if (th->wow64_context.ContextFlags)
@@ -1311,12 +1288,12 @@ windows_nat_target::windows_continue (DWORD continue_status, int id,
 	    if (th->debug_registers_changed)
 	      {
 		th->context.ContextFlags |= CONTEXT_DEBUG_REGISTERS;
-		th->context.Dr0 = windows_process.dr[0];
-		th->context.Dr1 = windows_process.dr[1];
-		th->context.Dr2 = windows_process.dr[2];
-		th->context.Dr3 = windows_process.dr[3];
+		th->context.Dr0 = state->dr_mirror[0];
+		th->context.Dr1 = state->dr_mirror[1];
+		th->context.Dr2 = state->dr_mirror[2];
+		th->context.Dr3 = state->dr_mirror[3];
 		th->context.Dr6 = DR6_CLEAR_VALUE;
-		th->context.Dr7 = windows_process.dr[7];
+		th->context.Dr7 = state->dr_control_mirror;
 		th->debug_registers_changed = false;
 	      }
 	    if (th->context.ContextFlags)
@@ -1454,22 +1431,6 @@ windows_nat_target::resume (ptid_t ptid, int step, enum gdb_signal sig)
 	      fetch_registers (regcache, gdbarch_ps_regnum (gdbarch));
 	      th->wow64_context.EFlags |= FLAG_TRACE_BIT;
 	    }
-
-	  if (th->wow64_context.ContextFlags)
-	    {
-	      if (th->debug_registers_changed)
-		{
-		  th->wow64_context.Dr0 = windows_process.dr[0];
-		  th->wow64_context.Dr1 = windows_process.dr[1];
-		  th->wow64_context.Dr2 = windows_process.dr[2];
-		  th->wow64_context.Dr3 = windows_process.dr[3];
-		  th->wow64_context.Dr6 = DR6_CLEAR_VALUE;
-		  th->wow64_context.Dr7 = windows_process.dr[7];
-		  th->debug_registers_changed = false;
-		}
-	      CHECK (Wow64SetThreadContext (th->h, &th->wow64_context));
-	      th->wow64_context.ContextFlags = 0;
-	    }
 	}
       else
 #endif
@@ -1481,22 +1442,6 @@ windows_nat_target::resume (ptid_t ptid, int step, enum gdb_signal sig)
 	      struct gdbarch *gdbarch = regcache->arch ();
 	      fetch_registers (regcache, gdbarch_ps_regnum (gdbarch));
 	      th->context.EFlags |= FLAG_TRACE_BIT;
-	    }
-
-	  if (th->context.ContextFlags)
-	    {
-	      if (th->debug_registers_changed)
-		{
-		  th->context.Dr0 = windows_process.dr[0];
-		  th->context.Dr1 = windows_process.dr[1];
-		  th->context.Dr2 = windows_process.dr[2];
-		  th->context.Dr3 = windows_process.dr[3];
-		  th->context.Dr6 = DR6_CLEAR_VALUE;
-		  th->context.Dr7 = windows_process.dr[7];
-		  th->debug_registers_changed = false;
-		}
-	      CHECK (SetThreadContext (th->h, &th->context));
-	      th->context.ContextFlags = 0;
 	    }
 	}
     }
@@ -1879,20 +1824,17 @@ windows_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
 void
 windows_nat_target::do_initial_windows_stuff (DWORD pid, bool attaching)
 {
-  int i;
   struct inferior *inf;
 
   windows_process.last_sig = GDB_SIGNAL_0;
   windows_process.open_process_used = 0;
-  for (i = 0;
-       i < sizeof (windows_process.dr) / sizeof (windows_process.dr[0]);
-       i++)
-    windows_process.dr[i] = 0;
 #ifdef __CYGWIN__
   windows_process.cygwin_load_start = 0;
   windows_process.cygwin_load_end = 0;
 #endif
-  windows_process.current_event.dwProcessId = pid;
+  windows_process.process_id = pid;
+  /* no point setting this if we're about to clear it with memset.  */
+  /* windows_process.current_event.dwProcessId = pid; */
   memset (&windows_process.current_event, 0,
 	  sizeof (windows_process.current_event));
   inf = current_inferior ();
@@ -3177,7 +3119,6 @@ cygwin_set_dr (int i, CORE_ADDR addr)
 {
   if (i < 0 || i > 3)
     internal_error (_("Invalid register %d in cygwin_set_dr.\n"), i);
-  windows_process.dr[i] = addr;
 
   for (auto &th : windows_process.thread_list)
     th->debug_registers_changed = true;
@@ -3189,8 +3130,6 @@ cygwin_set_dr (int i, CORE_ADDR addr)
 static void
 cygwin_set_dr7 (unsigned long val)
 {
-  windows_process.dr[7] = (CORE_ADDR) val;
-
   for (auto &th : windows_process.thread_list)
     th->debug_registers_changed = true;
 }
@@ -3200,26 +3139,69 @@ cygwin_set_dr7 (unsigned long val)
 static CORE_ADDR
 cygwin_get_dr (int i)
 {
-  return windows_process.dr[i];
+  windows_thread_info *th
+    = windows_process.thread_rec (inferior_ptid, DONT_INVALIDATE_CONTEXT);
+
+#ifdef __x86_64__
+  if (windows_process.wow64_process)
+    {
+      gdb_assert (th->wow64_context.ContextFlags != 0);
+      switch (i)
+	{
+	case 0:
+	  return th->wow64_context.Dr0;
+	case 1:
+	  return th->wow64_context.Dr1;
+	case 2:
+	  return th->wow64_context.Dr2;
+	case 3:
+	  return th->wow64_context.Dr3;
+	case 6:
+	  return th->wow64_context.Dr6;
+	case 7:
+	  return th->wow64_context.Dr7;
+	};
+    }
+  else
+#endif
+    {
+      gdb_assert (th->context.ContextFlags != 0);
+      switch (i)
+	{
+	case 0:
+	  return th->context.Dr0;
+	case 1:
+	  return th->context.Dr1;
+	case 2:
+	  return th->context.Dr2;
+	case 3:
+	  return th->context.Dr3;
+	case 6:
+	  return th->context.Dr6;
+	case 7:
+	  return th->context.Dr7;
+	};
+    }
+
+  gdb_assert_not_reached ("invalid x86 dr register number: %d", i);
 }
 
-/* Get the value of the DR6 debug status register from the inferior.
-   Here we just return the value stored in dr[6]
-   by the last call to thread_rec for current_event.dwThreadId id.  */
+/* Get the value of the DR6 debug status register from the
+   inferior.  */
+
 static unsigned long
 cygwin_get_dr6 (void)
 {
-  return (unsigned long) windows_process.dr[6];
+  return cygwin_get_dr (6);
 }
 
-/* Get the value of the DR7 debug status register from the inferior.
-   Here we just return the value stored in dr[7] by the last call to
-   thread_rec for current_event.dwThreadId id.  */
+/* Get the value of the DR7 debug status register from the
+   inferior.  */
 
 static unsigned long
 cygwin_get_dr7 (void)
 {
-  return (unsigned long) windows_process.dr[7];
+  return cygwin_get_dr (7);
 }
 
 /* Determine if the thread referenced by "ptid" is alive
