@@ -933,6 +933,66 @@ disable_randomization_available ()
 	  && DeleteProcThreadAttributeList != nullptr);
 }
 
+/* We can find the Windows major/minor/build in the KUSER_SHARED_DATA
+   structure, which defines the layout of a data area that the kernel
+   places at a pre-set address for sharing with user-mode software.
+
+     https://www.geoffchappell.com/studies/windows/km/ntoskrnl/structs/kuser_shared_data/index.htm
+
+   GetVersionEx or the Version Helper functions (IsWindows10OrGreater,
+   VerifyVersionInfo, etc.) don't work for Windows 10 and above,
+   because unless the binary includes a XML manifest declaring support
+   for such Windows versions, the functions always return "Windows
+   8.2".  KUSER_SHARED_DATA gives you the actual running OS info even
+   without the manifest.  */
+#define KUSER_SHARED_DATA 0x7ffe0000
+
+/* The Windows major version number.  */
+
+static inline ULONG
+windows_major_version ()
+{
+  return *(ULONG *) (KUSER_SHARED_DATA + 0x026c);
+}
+
+/* The Windows minor version number.  */
+
+static inline ULONG
+windows_minor_version ()
+{
+  return *(ULONG *) (KUSER_SHARED_DATA + 0x0270);
+}
+
+/* The Windows build number.  Windows build version info can be found
+   here:
+
+     https://www.gaijin.at/en/infos/windows-version-numbers
+ */
+
+static inline ULONG
+windows_build_number ()
+{
+  return *(ULONG *) (KUSER_SHARED_DATA + 0x0260);
+}
+
+/* See windows-nat.h.  */
+
+bool
+dbg_reply_later_available ()
+{
+#if 0
+  debug_printf ("Windows Major Version: %d\n", windows_major_version ());
+  debug_printf ("Windows Minor Version: %d\n", windows_minor_version ());
+  debug_printf ("Windows Build Number: %d\n", windows_build_number ());
+#endif
+
+  /* Supported since Windows 10, Version 1507, which is reported as
+     build number 10240.  */
+  return (windows_major_version () > 10
+	  || (windows_major_version () == 10
+	      && windows_build_number () >= 10240));
+}
+
 /* See windows-nat.h.  */
 
 bool
