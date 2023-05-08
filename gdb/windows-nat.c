@@ -94,14 +94,11 @@ struct windows_per_inferior : public windows_process_info
   windows_thread_info *find_thread (ptid_t ptid) override;
   windows_thread_info *thread_rec (ptid_t ptid,
 				   thread_disposition_type disposition) override;
-  int handle_output_debug_string (struct target_waitstatus *ourstatus) override;
+  DWORD handle_output_debug_string (struct target_waitstatus *ourstatus) override;
   void handle_load_dll (const char *dll_name, LPVOID base) override;
   void handle_unload_dll () override;
   bool handle_access_violation (const EXCEPTION_RECORD *rec) override;
 
-
-  int have_saved_context = 0;	/* True if we've saved context from a
-				   cygwin signal.  */
 
   int windows_initialization_done = 0;
 
@@ -139,9 +136,6 @@ struct windows_per_inferior : public windows_process_info
   std::vector<windows_solib> solibs;
 
 #ifdef __CYGWIN__
-  CONTEXT saved_context {};	/* Contains the saved context from a
-				   cygwin signal.  */
-
   /* The starting and ending address of the cygwin1.dll text segment.  */
   CORE_ADDR cygwin_load_start = 0;
   CORE_ADDR cygwin_load_end = 0;
@@ -730,30 +724,23 @@ windows_nat_target::fetch_registers (struct regcache *regcache, int r)
 
   if (th->reload_context)
     {
-#ifdef __CYGWIN__
-      if (windows_process.have_saved_context)
-	{
-	  /* Lie about where the program actually is stopped since
-	     cygwin has informed us that we should consider the signal
-	     to have occurred at another location which is stored in
-	     "saved_context.  */
-	  memcpy (&th->context, &windows_process.saved_context,
-		  __COPY_CONTEXT_SIZE);
-	  windows_process.have_saved_context = 0;
-	}
-      else
-#endif
 #ifdef __x86_64__
       if (windows_process.wow64_process)
 	{
-	  th->wow64_context.ContextFlags = CONTEXT_DEBUGGER_DR;
-	  CHECK (Wow64GetThreadContext (th->h, &th->wow64_context));
+	  if (th->wow64_context.ContextFlags == 0)
+	    {
+	      th->wow64_context.ContextFlags = CONTEXT_DEBUGGER_DR;
+	      CHECK (Wow64GetThreadContext (th->h, &th->wow64_context));
+	    }
 	}
       else
 #endif
 	{
-	  th->context.ContextFlags = CONTEXT_DEBUGGER_DR;
-	  CHECK (GetThreadContext (th->h, &th->context));
+	  if (th->context.ContextFlags == 0)
+	    {
+	      th->context.ContextFlags = CONTEXT_DEBUGGER_DR;
+	      CHECK (GetThreadContext (th->h, &th->context));
+	    }
 	}
       th->reload_context = false;
     }
@@ -987,11 +974,11 @@ signal_event_command (const char *args, int from_tty)
 
 /* See nat/windows-nat.h.  */
 
-int
+DWORD
 windows_per_inferior::handle_output_debug_string
      (struct target_waitstatus *ourstatus)
 {
-  int retval = 0;
+  DWORD thread_id = 0;
 
   gdb::unique_xmalloc_ptr<char> s
     = (target_read_string
@@ -1030,22 +1017,28 @@ windows_per_inferior::handle_output_debug_string
 	{
 	  LPCVOID x;
 	  SIZE_T n;
+	  CONTEXT saved_context;
 
 	  ourstatus->set_stopped (gotasig);
-	  retval = strtoul (p, &p, 0);
-	  if (!retval)
-	    retval = current_event.dwThreadId;
+	  thread_id = strtoul (p, &p, 0);
+	  if (thread_id == 0)
+	    thread_id = current_event.dwThreadId;
 	  else if ((x = (LPCVOID) (uintptr_t) strtoull (p, NULL, 0))
 		   && ReadProcessMemory (handle, x,
 					 &saved_context,
 					 __COPY_CONTEXT_SIZE, &n)
 		   && n == __COPY_CONTEXT_SIZE)
-	    have_saved_context = 1;
+	    {
+	      ptid_t ptid (current_event.dwProcessId, thread_id, 0);
+	      windows_thread_info *th = find_thread (ptid);
+	      if (th != nullptr)
+		th->context = saved_context;
+	    }
 	}
     }
 #endif
 
-  return retval;
+  return thread_id;
 }
 
 static int
@@ -1546,7 +1539,6 @@ windows_nat_target::get_windows_debug_event
 
   event_code = windows_process.current_event.dwDebugEventCode;
   ourstatus->set_spurious ();
-  windows_process.have_saved_context = 0;
 
   switch (event_code)
     {
