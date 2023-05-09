@@ -708,7 +708,6 @@ windows_nat_target::fetch_registers (struct regcache *regcache, int r)
     {
       if (th->wow64_context.ContextFlags == 0)
 	{
-	  th->suspend ();
 	  th->wow64_context.ContextFlags = CONTEXT_DEBUGGER_DR;
 	  CHECK (Wow64GetThreadContext (th->h, &th->wow64_context));
 	}
@@ -718,7 +717,6 @@ windows_nat_target::fetch_registers (struct regcache *regcache, int r)
     {
       if (th->context.ContextFlags == 0)
 	{
-	  th->suspend ();
 	  th->context.ContextFlags = CONTEXT_DEBUGGER_DR;
 	  CHECK (GetThreadContext (th->h, &th->context));
 	}
@@ -1298,12 +1296,6 @@ windows_nat_target::windows_continue (DWORD continue_status, int id,
 	  }
 	th->resume ();
       }
-    else
-      {
-	/* When single-stepping a specific thread, other threads must
-	   be suspended.  */
-	th->suspend ();
-      }
 
   gdb::optional<unsigned> err;
   do_synchronously ([&] ()
@@ -1793,6 +1785,11 @@ windows_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
 		  th->stopped_at_software_breakpoint = true;
 		  th->pc_adjusted = false;
 		}
+
+	      /* All-stop, suspend all threads until they are
+		 explicitly resumed.  */
+	      for (auto &thr : windows_process.thread_list)
+		thr->suspend ();
 	    }
 
 	  return result;
