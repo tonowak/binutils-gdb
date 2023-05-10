@@ -75,6 +75,61 @@
 #include "ser-event.h"
 #include "inf-loop.h"
 
+/* This comment documents high-level logic of this file.
+
+all-stop
+========
+
+In all-stop mode, there is only ever one Windows debug event in
+flight. When we receive an event from WaitForDebugEvent, the kernel
+has already implicitly suspended all the threads of the process.  We
+report the breaking event to the core.  When the core decides to
+resume the inferior, it calls windows_nat_target:resume, which
+triggers a ContinueDebugEvent call.  This call makes all unsuspended
+threads schedulable again, and we go back to waiting for the next
+event in WaitForDebugEvent.
+
+non-stop
+========
+
+For non-stop mode, we utilize the DBG_REPLY_LATER flag in the
+ContinueDebugEvent function.  According to Microsoft:
+
+ "This flag causes dwThreadId to replay the existing breaking event
+ after the target continues.  By calling the SuspendThread API against
+ dwThreadId, a debugger can resume other threads in the process and
+ later return to the breaking."
+
+To enable non-stop mode, windows_nat_target::wait suspends the thread,
+calls 'ContinueForDebugEvent(..., DBG_REPLY_LATER)', and sets the
+process_thread thread to wait for the next event using
+WaitForDebugEvent, all before returning the original breaking event to
+the core.
+
+When the user/core finally decides to resume the inferior thread that
+reported the event, we unsuspend it using ResumeThread.  Unlike in
+all-stop mode, we don't call ContinueDebugEvent then, as it has
+already been called when the event was first encountered.  By making
+the inferior thread schedulable again, WaitForDebugEvent re-reports
+the same event (due to the earlier DBG_REPLY_LATER).  In
+windows_nat_target::wait, we detect this delayed re-report and call
+ContinueDebugEvent on the thread, instructing the process_thread
+thread to continue waiting for the next event.
+
+During the initial thread resumption in windows_nat_target::resume, we
+recorded the dwContinueStatus argument to be passed to the last
+ContinueDebugEvent.  See windows_thread_info::auto_cont for details.
+
+Note that with this setup, in non-stop mode, every stopped thread has
+its own independent last-reported Windows debug event.  Therefore, we
+can decide on a per-thread basis whether to pass the thread's
+exception (DBG_EXCEPTION_NOT_HANDLED / DBG_CONTINUE) to the inferior.
+This per-thread decision is not possible in all-stop mode, where we
+only call ContinueDebugEvent for the thread that last reported a stop,
+at windows_nat_target::resume time.
+
+*/
+
 using namespace windows_nat;
 
 /* Maintain a linked list of "so" information.  */
@@ -101,6 +156,11 @@ enum windows_continue_flag
        call to continue the inferior -- we are either mourning it or
        detaching.  */
     WCONT_LAST_CALL = 2,
+
+    /* By default, windows_continue only calls ContinueDebugEvent in
+       all-stop mode.  This flag indicates that windows_continue
+       should call ContinueDebugEvent even in non-stop mode.  */
+    WCONT_CONTINUE_DEBUG_EVENT = 4,
   };
 
 DEF_ENUM_FLAGS_TYPE (windows_continue_flag, windows_continue_flags);
@@ -269,7 +329,11 @@ struct windows_nat_target final : public x86_nat_target<inf_child_target>
   void attach (const char *, int) override;
 
   bool attach_no_wait () override
-  { return true; }
+  {
+    /* In non-stop, after attach, we leave all threads running, like
+       other targets.  */
+    return !target_is_non_stop_p ();
+  }
 
   void detach (inferior *, int) override;
 
@@ -312,7 +376,10 @@ struct windows_nat_target final : public x86_nat_target<inf_child_target>
   std::string pid_to_str (ptid_t) override;
 
   void interrupt () override;
+  void stop (ptid_t) override;
   void pass_ctrlc () override;
+
+  void thread_events (int enable) override;
 
   const char *pid_to_exec_file (int pid) override;
 
@@ -343,6 +410,9 @@ struct windows_nat_target final : public x86_nat_target<inf_child_target>
     return m_is_async;
   }
 
+  bool supports_non_stop () override;
+  bool always_non_stop_p () override;
+
   void async (bool enable) override;
 
   int async_wait_fd () override
@@ -356,6 +426,8 @@ private:
 				   bool main_thread_p);
   void delete_thread (ptid_t ptid, DWORD exit_code, bool main_thread_p);
   DWORD fake_create_process (const DEBUG_EVENT &current_event);
+
+  void stop_one_thread (windows_thread_info *th);
 
   BOOL windows_continue (DWORD continue_status, int id,
 			 windows_continue_flags cont_flags = 0);
@@ -407,6 +479,9 @@ private:
 
   /* True if currently in async mode.  */
   bool m_is_async = false;
+
+  /* Whether target_thread_events is in effect.  */
+  int m_report_thread_events = 0;
 };
 
 static void
@@ -592,6 +667,13 @@ windows_nat_target::add_thread (ptid_t ptid, HANDLE h, void *tlb,
   /* It's simplest to always set this and update the debug
      registers.  */
   th->debug_registers_changed = true;
+
+  /* Even if we're stopping the thread for some reason internal to
+     this module, from the perspective of infrun and the
+     user/frontend, this new thread is running until it next reports a
+     stop.  */
+  set_running (this, ptid, true);
+  set_executing (this, ptid, true);
 
   return th;
 }
@@ -1304,6 +1386,7 @@ windows_per_inferior::continue_one_thread (windows_thread_info *th,
 	}
     }
   th->resume ();
+  th->stopping = false;
   th->last_sig = GDB_SIGNAL_0;
 }
 
@@ -1315,31 +1398,38 @@ BOOL
 windows_nat_target::windows_continue (DWORD continue_status, int id,
 				      windows_continue_flags cont_flags)
 {
-  for (auto &th : windows_process.thread_list)
-    {
-      if ((id == -1 || id == (int) th->tid)
-	  && !th->suspended
-	  && th->pending_status.kind () != TARGET_WAITKIND_IGNORE)
-	{
-	  DEBUG_EVENTS ("got matching pending stop event "
-			"for 0x%x, not resuming",
-			th->tid);
+  if ((cont_flags & (WCONT_LAST_CALL | WCONT_KILLED)) == 0)
+    for (auto &th : windows_process.thread_list)
+      {
+	if ((id == -1 || id == (int) th->tid)
+	    && !th->suspended
+	    && th->pending_status.kind () != TARGET_WAITKIND_IGNORE)
+	  {
+	    DEBUG_EVENTS ("got matching pending stop event "
+			  "for 0x%x, not resuming",
+			  th->tid);
 
-	  /* There's no need to really continue, because there's already
-	     another event pending.  However, we do need to inform the
-	     event loop of this.  */
-	  serial_event_set (m_wait_event);
-	  return TRUE;
-	}
-    }
+	    /* There's no need to really continue, because there's already
+	       another event pending.  However, we do need to inform the
+	       event loop of this.  */
+	    serial_event_set (m_wait_event);
+	    return TRUE;
+	  }
+      }
 
   for (auto &th : windows_process.thread_list)
-    if (id == -1 || id == (int) th->tid)
+    if (th->suspended
+	&& (id == -1 || id == (int) th->tid))
       windows_process.continue_one_thread (th.get (), cont_flags);
 
-  continue_last_debug_event_main_thread
-    (_("Failed to resume program execution"), continue_status,
-     cont_flags & WCONT_LAST_CALL);
+  if (!target_is_non_stop_p ()
+      || (cont_flags & WCONT_CONTINUE_DEBUG_EVENT) != 0)
+    {
+      DEBUG_EVENTS ("windows_continue -> continue_last_debug_event");
+      continue_last_debug_event_main_thread
+	(_("Failed to resume program execution"), continue_status,
+	 cont_flags & WCONT_LAST_CALL);
+    }
 
   return TRUE;
 }
@@ -1391,13 +1481,27 @@ windows_nat_target::resume (ptid_t ptid, int step, enum gdb_signal sig)
 
   if (sig != GDB_SIGNAL_0)
     {
+      /* Allow continuing with the same signal that interrupted us.
+	 Otherwise complain.  */
+
       /* Note it is OK to call get_last_debug_event_ptid() from the
-	 main thread here, because we know the process_thread thread
-	 isn't waiting for an event at this point, so there's no data
-	 race.  */
-      if (inferior_ptid != get_last_debug_event_ptid ())
+	 main thread here in all-stop, because we know the
+	 process_thread thread is not waiting for an event at this
+	 point, so there is no data race.  We cannot call it in
+	 non-stop mode, as the process_thread thread _is_ waiting for
+	 events right now in that case.  However, the restriction does
+	 not exist in non-stop mode, so we don't even call it in that
+	 mode.  */
+      if (!target_is_non_stop_p ()
+	  && inferior_ptid != get_last_debug_event_ptid ())
 	{
-	  /* ContinueDebugEvent will be for a different thread.  */
+	  /* In all-stop, ContinueDebugEvent will be for a different
+	     thread.  For non-stop, we've called ContinueDebugEvent
+	     with DBG_REPLY_LATER for this thread, so we just set the
+	     intended continue status in 'auto_cont', which is later
+	     passed to ContinueDebugEvent in windows_nat_target::wait
+	     after we resume the thread and we get the replied-later
+	     (repeated) event out of WaitForDebugEvent.  */
 	  DEBUG_EXCEPT ("Cannot continue with signal %d here.  "
 			"Not last-event thread", sig);
 	}
@@ -1433,6 +1537,15 @@ windows_nat_target::resume (ptid_t ptid, int step, enum gdb_signal sig)
 		    th->last_sig);
     }
 
+  /* If DBG_REPLY_LATER was used on the thread, we override the
+     continue status that will be passed to ContinueDebugEvent later
+     with the continue status we've just determined fulfils the
+     caller's resumption request.  Note that DBG_REPLY_LATER is only
+     used in non-stop mode, and in that mode, windows_continue (called
+     below) does not call ContinueDebugEvent.  */
+  if (th->auto_cont != 0)
+    th->auto_cont = continue_status;
+
 #ifdef __x86_64__
   if (windows_process.wow64_process)
     {
@@ -1457,9 +1570,6 @@ windows_nat_target::resume (ptid_t ptid, int step, enum gdb_signal sig)
 	  th->context.EFlags |= FLAG_TRACE_BIT;
 	}
     }
-
-  /* Allow continuing with the same signal that interrupted us.
-     Otherwise complain.  */
 
   if (resume_all)
     windows_continue (continue_status, -1);
@@ -1508,10 +1618,87 @@ windows_nat_target::interrupt ()
 	     "Press Ctrl-c in the program console."));
 }
 
+/* Stop thread TH.  */
+
+void
+windows_nat_target::stop_one_thread (windows_thread_info *th)
+{
+  ptid_t thr_ptid (windows_process.process_id, th->tid);
+
+  if (th->suspended)
+    {
+      /* Already known to be stopped; do nothing.  */
+
+      DEBUG_EVENTS ("already suspended %s: suspended=%d, stopping=%d",
+		    thr_ptid.to_string ().c_str (),
+		    th->suspended, th->stopping);
+
+      /* Set stopping, but only if suspending didn't fail earlier.  If
+	 it did fail, most probably because the thread is exiting, let
+	 the exit event be reported instead.  */
+      if (th->suspended == 1)
+	th->stopping = true;
+    }
+  else if (th->auto_cont)
+    {
+      /* We used DBG_REPLY_LATER on this thread, so let it report back
+	 its event again first so we can auto-cont it.  */
+
+      DEBUG_EVENTS ("has auto-cont %s", thr_ptid.to_string ().c_str ());
+
+      th->stopping = true;
+    }
+  else
+    {
+      DEBUG_EVENTS ("stop request for %s", thr_ptid.to_string ().c_str ());
+
+      th->suspend ();
+      if (th->suspended == -1)
+	{
+	  DEBUG_EVENTS ("suspending failed for %s, exiting?",
+			thr_ptid.to_string ().c_str ());
+
+	  /* Do not set the stopping flag.  Let the exit event be
+	     reported instead.  */
+	}
+      else
+	{
+	  gdb_assert (th->suspended);
+
+	  th->stopping = true;
+	  th->pending_status.set_stopped (GDB_SIGNAL_0);
+	  th->last_event = {};
+	}
+
+      serial_event_set (m_wait_event);
+    }
+}
+
+/* Implementation of target_ops::stop.  */
+
+void
+windows_nat_target::stop (ptid_t ptid)
+{
+  for (auto &th : windows_process.thread_list)
+    {
+      ptid_t thr_ptid (windows_process.process_id, th->tid);
+      if (thr_ptid.matches (ptid))
+	stop_one_thread (th.get ());
+    }
+}
+
 void
 windows_nat_target::pass_ctrlc ()
 {
   interrupt ();
+}
+
+/* Implementation of the target_ops::thread_events method.  */
+
+void
+windows_nat_target::thread_events (int enable)
+{
+  m_report_thread_events = enable;
 }
 
 /* Get the next event from the child.  Returns the thread ptid.  */
@@ -1529,7 +1716,7 @@ windows_nat_target::get_windows_debug_event
      for details on why this is needed.  */
   for (auto &th : windows_process.thread_list)
     {
-      if (!th->suspended
+      if ((!th->suspended || th->stopping)
 	  && th->pending_status.kind () != TARGET_WAITKIND_IGNORE)
 	{
 	  DEBUG_EVENTS ("reporting pending event for 0x%x", th->tid);
@@ -1587,18 +1774,29 @@ windows_nat_target::get_windows_debug_event
 	 current_event->u.CreateThread.lpThreadLocalBase,
 	 false /* main_thread_p */);
 
+      if (m_report_thread_events)
+	ourstatus->set_thread_created ();
       break;
 
     case EXIT_THREAD_DEBUG_EVENT:
-      DEBUG_EVENTS ("kernel event for pid=%u tid=0x%x code=%s",
-		    (unsigned) current_event->dwProcessId,
-		    (unsigned) current_event->dwThreadId,
-		    "EXIT_THREAD_DEBUG_EVENT");
-      delete_thread (ptid_t (current_event->dwProcessId,
-			     current_event->dwThreadId, 0),
-		     current_event->u.ExitThread.dwExitCode,
-		     false /* main_thread_p */);
-      thread_id = 0;
+      {
+	DEBUG_EVENTS ("kernel event for pid=%u tid=0x%x code=%s",
+		      (unsigned) current_event->dwProcessId,
+		      (unsigned) current_event->dwThreadId,
+		      "EXIT_THREAD_DEBUG_EVENT");
+	ptid_t thr_ptid (current_event->dwProcessId,
+			 current_event->dwThreadId, 0);
+	if (m_report_thread_events)
+	  {
+	    ourstatus->set_thread_exited
+	      (current_event->u.ExitThread.dwExitCode);
+	    return thr_ptid;
+	  }
+	delete_thread (thr_ptid,
+		       current_event->u.ExitThread.dwExitCode,
+		       false /* main_thread_p */);
+	thread_id = 0;
+      }
       break;
 
     case CREATE_PROCESS_DEBUG_EVENT:
@@ -1807,6 +2005,10 @@ windows_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
       ptid_t result = get_windows_debug_event (pid, ourstatus, options,
 					       &current_event);
 
+      DEBUG_EVENTS ("get_windows_debug_event returned [%s : %s]",
+		    result.to_string ().c_str (),
+		    ourstatus->to_string ().c_str());
+
       if ((options & TARGET_WNOHANG) != 0
 	  && ourstatus->kind () == TARGET_WAITKIND_IGNORE)
 	return result;
@@ -1823,6 +2025,38 @@ windows_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
 	    {
 	      windows_thread_info *th = windows_process.find_thread (result);
 
+	      /* If we previously used DBG_REPLY_LATER on this thread,
+		 and we're seeing an event for it, it means we've
+		 already processed the event, and then subsequently
+		 resumed the thread, intending to pass AUTO_CONT to
+		 ContinueDebugEvent.  Do that now.  */
+	      if (th->auto_cont != 0)
+		{
+		  DEBUG_EVENTS ("auto-cont thread 0x%x, stopping: %d",
+				th->tid, th->stopping);
+
+		  /* If we wanted to stop the thread in
+		     windows_nat_target::stop, but it had an
+		     auto_cont, we didn't suspend the thread then,
+		     waiting for the DBG_REPLY_LATER repeated event to
+		     be consumed first.  Suspend it now, queue a
+		     pending GDB_SIGNAL_0 stop, and let the next
+		     iteration collect that pending stop.  */
+		  if (th->stopping)
+		    {
+		      th->suspend ();
+		      th->pending_status.set_stopped (GDB_SIGNAL_0);
+		      th->last_event = {};
+		    }
+
+		  /* Go back to waiting for the next event.  */
+		  continue_last_debug_event_main_thread
+		    (_("Failed to auto-continue thread"), th->auto_cont);
+
+		  th->auto_cont = 0;
+		  continue;
+		}
+
 	      th->stopped_at_software_breakpoint = false;
 	      if (current_event.dwDebugEventCode
 		  == EXCEPTION_DEBUG_EVENT
@@ -1836,10 +2070,44 @@ windows_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
 		  th->pc_adjusted = false;
 		}
 
+	      /* If non-stop, suspend the event thread, and continue
+		 it with DBG_REPLY_LATER, so the other threads go back
+		 to running as soon as possible.  Don't do this if
+		 stopping the thread, as in that case the thread was
+		 already suspended, and also there's no real Windows
+		 debug event to continue in that case.  */
+	      if (windows_process.windows_initialization_done
+		  && target_is_non_stop_p ()
+		  && !th->stopping)
+		{
+		  if (ourstatus->kind () == TARGET_WAITKIND_THREAD_EXITED)
+		    {
+		      /* If we failed to suspend the thread in
+			 windows_nat_target::stop, then 'suspended'
+			 will be -1 here.  */
+		      gdb_assert (th->suspended < 1);
+		      delete_thread (result,
+				     ourstatus->exit_status (),
+				     false /* main_thread_p */);
+		      continue_last_debug_event_main_thread
+			(_("Init: Failed to DBG_CONTINUE after thread exit"),
+			 DBG_CONTINUE);
+		    }
+		  else
+		    {
+		      th->suspend ();
+		      th->auto_cont = DBG_CONTINUE;
+		      continue_last_debug_event_main_thread
+			(_("Init: Failed to defer event with DBG_REPLY_LATER"),
+			 DBG_REPLY_LATER);
+		    }
+		}
+
 	      /* All-stop, suspend all threads until they are
 		 explicitly resumed.  */
-	      for (auto &thr : windows_process.thread_list)
-		thr->suspend ();
+	      if (!target_is_non_stop_p ())
+		for (auto &thr : windows_process.thread_list)
+		  thr->suspend ();
 	    }
 
 	  /* If something came out, assume there may be more.  This is
@@ -1923,7 +2191,7 @@ windows_nat_target::do_initial_windows_stuff (DWORD pid, bool attaching)
       /* Don't use windows_nat_target::resume here because that
 	 assumes that inferior_ptid points at a valid thread, and we
 	 haven't switched to any thread yet.  */
-      windows_continue (DBG_CONTINUE, -1);
+      windows_continue (DBG_CONTINUE, -1, WCONT_CONTINUE_DEBUG_EVENT);
     }
 
   switch_to_thread (this->find_thread (last_ptid));
@@ -2056,7 +2324,29 @@ windows_nat_target::attach (const char *args, int from_tty)
 #endif
 
   do_initial_windows_stuff (pid, 1);
-  target_terminal::ours ();
+
+  if (target_is_non_stop_p ())
+    {
+      /* Leave all threads running.  */
+
+      continue_last_debug_event_main_thread
+	(_("Failed to DBG_CONTINUE after attach"),
+	 DBG_CONTINUE);
+
+      /* The thread that reports the initial breakpoint, and thus ends
+	 up as selected thread here, was injected by Windows into the
+	 program for the attach, and it exits as soon as we resume it.
+	 Switch to the first thread in the inferior, otherwise the
+	 user will be left with an exited thread selected.  */
+      switch_to_thread (first_thread_of_inferior (current_inferior ()));
+    }
+  else
+    {
+      set_running (this, minus_one_ptid, false);
+      set_executing (this, minus_one_ptid, false);
+
+      target_terminal::ours ();
+    }
 }
 
 void
@@ -2064,9 +2354,29 @@ windows_nat_target::detach (inferior *inf, int from_tty)
 {
   windows_continue (DBG_CONTINUE, -1, WCONT_LAST_CALL);
 
+  if (target_is_non_stop_p ())
+    {
+      /* In non-stop mode, the process_thread helper thread is always
+	 waiting for events, and the WCONT_LAST_CALL above has no
+	 effect.  Since the thread is blocked in WaitForDebugEvent
+	 (unless it already saw some event we haven't collected yet),
+	 we need to unblock it so that we can have it call
+	 DebugActiveProcessStop below.  The only way to achieve this
+	 is to inject a thread into the inferior that raises an event.
+	 We will discard/ignore this event, but that is harmless.  */
+      interrupt ();
+    }
+
   gdb::optional<unsigned> err;
   do_synchronously ([&] ()
     {
+      /* If we get here, and in non-stop, we know the helper thread
+	 unblocked out of WaitForDebugEvent.  Discard the last event
+	 that it saw.  Breakpoints have already been removed at this
+	 point, so this is harmless (there's no risk of needing to
+	 adjust the PC after a breakpoint).  */
+      m_debug_event_pending = false;
+
       if (!DebugActiveProcessStop (windows_process.process_id))
 	err = (unsigned) GetLastError ();
       else
@@ -2798,13 +3108,33 @@ windows_nat_target::create_inferior (const char *exec_file,
 
   do_initial_windows_stuff (pi.dwProcessId, 0);
 
-  /* windows_continue (DBG_CONTINUE, -1); */
+  /* There is one thread in the process now, and inferior_ptid points
+     to it.  Present it as stopped to the core.  */
+  windows_thread_info *th = windows_process.find_thread (inferior_ptid);
+
+  th->suspend ();
+  set_running (this, inferior_ptid, false);
+  set_executing (this, inferior_ptid, false);
+
+  if (target_is_non_stop_p ())
+    {
+      /* In non-stop mode, we always immediately use DBG_REPLY_LATER
+	 on threads as soon as they report an event.  However, during
+	 the initial startup, windows_nat_target::wait does not do
+	 this, so we need to handle it here for the initial
+	 thread.  */
+      th->auto_cont = DBG_CONTINUE;
+      continue_last_debug_event_main_thread
+	(_("Failed to defer event with DBG_REPLY_LATER"),
+	 DBG_REPLY_LATER);
+    }
 }
 
 void
 windows_nat_target::mourn_inferior ()
 {
-  windows_continue (DBG_CONTINUE, -1, WCONT_LAST_CALL);
+  windows_continue (DBG_CONTINUE, -1,
+		    WCONT_LAST_CALL | WCONT_CONTINUE_DEBUG_EVENT);
   x86_cleanup_dregs();
   if (windows_process.open_process_used)
     {
@@ -2878,14 +3208,28 @@ windows_nat_target::kill ()
 {
   CHECK (TerminateProcess (windows_process.handle, 0));
 
+  /* In non-stop mode, windows_continue does not call
+     ContinueDebugEvent by default.  This behavior is appropriate for
+     the first call to windows_continue because any thread that is
+     stopped has already been ContinueDebugEvent'ed with
+     DBG_REPLY_LATER.  However, after the first
+     wait_for_debug_event_main_thread call in the loop, this will no
+     longer be true.
+
+     In all-stop mode, the WCONT_CONTINUE_DEBUG_EVENT flag has no
+     effect, so writing the code in this way ensures that the code is
+     the same for both modes.  */
+  windows_continue_flags flags = WCONT_KILLED;
+
   for (;;)
     {
-      if (!windows_continue (DBG_CONTINUE, -1, WCONT_KILLED))
+      if (!windows_continue (DBG_CONTINUE, -1, flags))
 	break;
       DEBUG_EVENT current_event;
       wait_for_debug_event_main_thread (&current_event);
       if (current_event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
 	break;
+      flags |= WCONT_CONTINUE_DEBUG_EVENT;
     }
 
   target_mourn_inferior (inferior_ptid);	/* Or just windows_mourn_inferior?  */
@@ -3024,6 +3368,24 @@ windows_nat_target::thread_name (struct thread_info *thr)
   return th->thread_name ();
 }
 
+/* Implementation of the target_ops::supports_non_stop method.  */
+
+bool
+windows_nat_target::supports_non_stop ()
+{
+  /* Non-stop support requires DBG_REPLY_LATER, which only exists on
+     Windows 10 and later.  */
+  return dbg_reply_later_available ();
+}
+
+/* Implementation of the target_ops::always_non_stop_p method.  */
+
+bool
+windows_nat_target::always_non_stop_p ()
+{
+  /* If we can do non-stop, prefer it.  */
+  return supports_non_stop ();
+}
 
 void _initialize_windows_nat ();
 void

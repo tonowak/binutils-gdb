@@ -81,11 +81,33 @@ struct windows_thread_info
   /* Thread Information Block address.  */
   CORE_ADDR thread_local_base;
 
+  /* If the thread had its event postponed with DBG_REPLY_LATER, when
+     we later ResumeThread this thread, WaitForDebugEvent will
+     re-report the postponed event.  This field holds the continue
+     status value to be automatically passed to ContinueDebugEvent
+     when we encounter this re-reported event.  0 if the thread has
+     not had its event postponed with DBG_REPLY_LATER. */
+  DWORD auto_cont = 0;
+
   /* This keeps track of whether SuspendThread was called on this
      thread.  -1 means there was a failure or that the thread was
      explicitly not suspended, 1 means it was called, and 0 means it
      was not.  */
   int suspended = 0;
+
+  /* This flag indicates whether we are explicitly stopping this
+     thread in response to a target_stop request.  This allows
+     distinguishing between threads that are explicitly stopped by the
+     debugger and threads that are stopped due to other reasons.
+
+     Typically, when we want to stop a thread, we suspend it, enqueue
+     a pending GDB_SIGNAL_0 stop status on the thread, and then set
+     this flag to true.  However, if the thread has had its event
+     previously postponed with DBG_REPLY_LATER, it means that it
+     already has an event to report.  In such case, we simply set the
+     'stopping' flag without suspending the thread or enqueueing a
+     pending stop.  See stop_one_thread.  */
+  bool stopping = false;
 
 /* Info about a potential pending stop.
 
@@ -407,6 +429,11 @@ extern DeleteProcThreadAttributeList_ftype *DeleteProcThreadAttributeList;
    host.  */
 
 extern bool disable_randomization_available ();
+
+/* This is available starting with Windows 10.  */
+#ifndef DBG_REPLY_LATER
+# define DBG_REPLY_LATER 0x40010001L
+#endif
 
 /* Return true if it's possible to use DBG_REPLY_LATER with
    ContinueDebugEvent on this host.  */
