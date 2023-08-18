@@ -141,7 +141,7 @@ static const char *i386_mmx_names[] =
 
 static const char *i386_byte_names[] =
 {
-  "al", "cl", "dl", "bl", 
+  "al", "cl", "dl", "bl",
   "ah", "ch", "dh", "bh"
 };
 
@@ -384,7 +384,7 @@ i386_fpc_regnum_p (struct gdbarch *gdbarch, int regnum)
   if (I387_ST0_REGNUM (tdep) < 0)
     return 0;
 
-  return (I387_FCTRL_REGNUM (tdep) <= regnum 
+  return (I387_FCTRL_REGNUM (tdep) <= regnum
 	  && regnum < I387_XMM0_REGNUM (tdep));
 }
 
@@ -1217,7 +1217,7 @@ i386_analyze_struct_return (CORE_ADDR pc, CORE_ADDR current_pc,
       cache->pc_in_eax = 1;
       return current_pc;
     }
-  
+
   if (buf[1] == proto1[1])
     return pc + 4;
   else
@@ -1232,7 +1232,7 @@ i386_skip_probe (CORE_ADDR pc)
         pushl constant
         call _probe
 	addl $4, %esp
-	   
+
      followed by
 
         pushl %ebp
@@ -1292,7 +1292,7 @@ i386_analyze_stack_align (CORE_ADDR pc, CORE_ADDR current_pc,
 		pushl -4(%reg)
 
      "andl $-XXX, %esp" can be either 3 bytes or 6 bytes:
-     
+
      	0x83 0xe4 0xf0			andl $-16, %esp
      	0x81 0xe4 0x00 0xff 0xff 0xff	andl $-256, %esp
    */
@@ -1343,7 +1343,7 @@ i386_analyze_stack_align (CORE_ADDR pc, CORE_ADDR current_pc,
       /* MOD must be binary 10 and R/M must be binary 100.  */
       if ((buf[2] & 0xc7) != 0x44)
 	return pc;
-      
+
       /* REG has register number.  Registers in pushl and leal have to
 	 be the same.  */
       if (reg != ((buf[2] >> 3) & 7))
@@ -1488,7 +1488,7 @@ i386_match_insn_block (CORE_ADDR pc, struct i386_insn *insn_patterns)
 struct i386_insn i386_frame_setup_skip_insns[] =
 {
   /* Check for `movb imm8, r' and `movl imm32, r'.
-    
+
      ??? Should we handle 16-bit operand-sizes here?  */
 
   /* `movb imm8, %al' and `movb imm8, %ah' */
@@ -1545,11 +1545,11 @@ i386_skip_noop (CORE_ADDR pc)
   if (target_read_code (pc, &op, 1))
     return pc;
 
-  while (check) 
+  while (check)
     {
       check = 0;
       /* Ignore `nop' instruction.  */
-      if (op == 0x90) 
+      if (op == 0x90)
 	{
 	  pc += 1;
 	  if (target_read_code (pc, &op, 1))
@@ -1582,7 +1582,7 @@ i386_skip_noop (CORE_ADDR pc)
 	    }
 	}
     }
-  return pc; 
+  return pc;
 }
 
 /* Check whether PC points at a code that sets up a new stack frame.
@@ -1691,7 +1691,7 @@ i386_analyze_frame_setup (struct gdbarch *gdbarch,
       if (limit <= pc)
 	return limit;
 
-      /* Check for stack adjustment 
+      /* Check for stack adjustment
 
 	    subl $XXX, %esp
 	 or
@@ -1802,7 +1802,7 @@ i386_analyze_register_saves (CORE_ADDR pc, CORE_ADDR current_pc,
    %ebx (and sometimes a harmless bug causes it to also save but not
    restore %eax); however, the code below is willing to see the pushes
    in any order, and will handle up to 8 of them.
- 
+
    If the setup sequence is at the end of the function, then the next
    instruction will be a branch back to the start.  */
 
@@ -1852,7 +1852,7 @@ i386_skip_prologue (struct gdbarch *gdbarch, CORE_ADDR start_pc)
 	      && startswith (COMPUNIT_PRODUCER (cust), "clang ")))
         return std::max (start_pc, post_prologue_pc);
     }
- 
+
   cache.locals = -1;
   pc = i386_analyze_prologue (gdbarch, start_pc, 0xffffffff, &cache);
   if (cache.locals < 0)
@@ -2319,7 +2319,7 @@ static const struct frame_unwind i386_epilogue_frame_unwind =
   i386_epilogue_frame_unwind_stop_reason,
   i386_epilogue_frame_this_id,
   i386_epilogue_frame_prev_register,
-  NULL, 
+  NULL,
   i386_epilogue_frame_sniffer
 };
 
@@ -2400,7 +2400,7 @@ static const struct frame_unwind i386_stack_tramp_frame_unwind =
   i386_epilogue_frame_unwind_stop_reason,
   i386_epilogue_frame_this_id,
   i386_epilogue_frame_prev_register,
-  NULL, 
+  NULL,
   i386_stack_tramp_frame_sniffer
 };
 
@@ -4598,7 +4598,7 @@ i386_register_reggroup_p (struct gdbarch *gdbarch, int regnum,
 /* Get the ARGIth function argument for the current function.  */
 
 static CORE_ADDR
-i386_fetch_pointer_argument (struct frame_info *frame, int argi, 
+i386_fetch_pointer_argument (struct frame_info *frame, int argi,
 			     struct type *type)
 {
   struct gdbarch *gdbarch = get_frame_arch (frame);
@@ -5580,7 +5580,7 @@ i386_process_record (struct gdbarch *gdbarch, struct regcache *regcache,
 	  ir.addr -= 1;
 	  goto no_support;
 	}
-      for (regnum = X86_RECORD_REAX_REGNUM; 
+      for (regnum = X86_RECORD_REAX_REGNUM;
 	   regnum <= X86_RECORD_REDI_REGNUM;
 	   regnum++)
 	I386_RECORD_FULL_ARCH_LIST_ADD_REG (regnum);
@@ -8350,6 +8350,69 @@ i386_type_align (struct gdbarch *gdbarch, struct type *type)
   return TYPE_LENGTH (type);
 }
 
+#define I386_TYPE_ADDRESS_CLASS_OCAML TYPE_ADDRESS_CLASS_1
+#define I386_TYPE_INSTANCE_FLAG_ADDRESS_CLASS_OCAML  \
+  TYPE_INSTANCE_FLAG_ADDRESS_CLASS_1
+
+static void
+i386_address_to_pointer (struct gdbarch *gdbarch,
+			struct type *type, gdb_byte *buf, CORE_ADDR addr)
+{
+  enum bfd_endian byte_order = gdbarch_byte_order (gdbarch);
+
+  if (I386_TYPE_ADDRESS_CLASS_OCAML (type))
+    {
+      addr -= 8;
+    }
+  store_unsigned_integer (buf, TYPE_LENGTH (type), byte_order, addr);
+}
+
+static CORE_ADDR
+i386_pointer_to_address (struct gdbarch *gdbarch,
+			struct type *type, const gdb_byte *buf)
+{
+  enum bfd_endian byte_order = gdbarch_byte_order (gdbarch);
+  CORE_ADDR addr
+    = extract_unsigned_integer (buf, TYPE_LENGTH (type), byte_order);
+
+  if (I386_TYPE_ADDRESS_CLASS_OCAML (type))
+    {
+      addr += 8;
+    }
+  return addr;
+}
+
+static int
+i386_address_class_type_flags (int byte_size, int dwarf2_addr_class)
+{
+  if (dwarf2_addr_class == 1 && byte_size == 2)
+    return I386_TYPE_INSTANCE_FLAG_ADDRESS_CLASS_OCAML;
+  return 0;
+}
+
+static const char*
+i386_address_class_type_flags_to_name (struct gdbarch *gdbarch, int type_flags)
+{
+  if (type_flags & I386_TYPE_INSTANCE_FLAG_ADDRESS_CLASS_OCAML)
+    return "ocaml";
+  else
+    return NULL;
+}
+
+static int
+i386_address_class_name_to_type_flags (struct gdbarch *gdbarch,
+                                      const char* name,
+                                      int *type_flags_ptr)
+{
+  if (strcmp (name, "ocaml") == 0)
+    {
+      *type_flags_ptr = I386_TYPE_INSTANCE_FLAG_ADDRESS_CLASS_OCAML;
+      return 1;
+    }
+  else
+    return 0;
+}
+
 
 /* Note: This is called for both i386 and amd64.  */
 
@@ -8408,8 +8471,15 @@ i386_gdbarch_init (struct gdbarch_info info, struct gdbarch_list *arches)
 
   tdep->record_regmap = i386_record_regmap;
 
-  set_gdbarch_type_align (gdbarch, i386_type_align);
+  set_gdbarch_address_to_pointer (gdbarch, i386_address_to_pointer);
+  set_gdbarch_pointer_to_address (gdbarch, i386_pointer_to_address);
+  set_gdbarch_address_class_type_flags (gdbarch, i386_address_class_type_flags);
+  set_gdbarch_address_class_name_to_type_flags
+    (gdbarch, i386_address_class_name_to_type_flags);
+  set_gdbarch_address_class_type_flags_to_name
+    (gdbarch, i386_address_class_type_flags_to_name);
 
+  set_gdbarch_type_align (gdbarch, i386_type_align);
   /* The format used for `long double' on almost all i386 targets is
      the i387 extended floating-point format.  In fact, of all targets
      in the GCC 2.95 tree, only OSF/1 does it different, and insists

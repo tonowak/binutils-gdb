@@ -1253,7 +1253,7 @@ val_print_scalar_formatted (struct type *type,
     {
       struct value_print_options opts = *options;
       opts.format = 0;
-      opts.deref_ref = 0;
+      opts.deref_ref = 1;
       val_print (type, embedded_offset, 0, stream, 0, val, &opts,
 		 current_language);
       return;

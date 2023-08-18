@@ -232,7 +232,7 @@ val_print_packed_array_elements (struct type *type, const gdb_byte *valaddr,
 	{
 	  struct value_print_options opts = *options;
 
-	  opts.deref_ref = 0;
+	  opts.deref_ref = 1;
 	  val_print (elttype,
 		     value_embedded_offset (v0), 0, stream,
 		     recurse + 1, v0, &opts, current_language);
@@ -246,7 +246,7 @@ val_print_packed_array_elements (struct type *type, const gdb_byte *valaddr,
 	  int j;
 	  struct value_print_options opts = *options;
 
-	  opts.deref_ref = 0;
+	  opts.deref_ref = 1;
 	  for (j = i0; j < i; j += 1)
 	    {
 	      if (j > i0)
@@ -688,7 +688,7 @@ print_field_values (struct type *type, const gdb_byte *valaddr,
 		     bit_pos % HOST_CHAR_BIT,
 		     bit_size, TYPE_FIELD_TYPE (type, i));
 	      opts = *options;
-	      opts.deref_ref = 0;
+	      opts.deref_ref = 1;
 	      val_print (TYPE_FIELD_TYPE (type, i),
 			 value_embedded_offset (v), 0,
 			 stream, recurse + 1, v,
@@ -699,7 +699,7 @@ print_field_values (struct type *type, const gdb_byte *valaddr,
 	{
 	  struct value_print_options opts = *options;
 
-	  opts.deref_ref = 0;
+	  opts.deref_ref = 1;
 	  val_print (TYPE_FIELD_TYPE (type, i),
 		     (offset + TYPE_FIELD_BITPOS (type, i) / HOST_CHAR_BIT),
 		     0, stream, recurse + 1, val, &opts, language);

@@ -371,7 +371,7 @@ val_print_struct (struct type *type, int embedded_offset,
     fputs_filtered ("{", stream);
 
   opts = *options;
-  opts.deref_ref = 0;
+  opts.deref_ref = 1;
 
   first_field = 1;
   for (i = 0; i < TYPE_NFIELDS (type); ++i)
@@ -427,7 +427,7 @@ rust_print_enum (struct type *type, int embedded_offset,
 {
   struct value_print_options opts = *options;
 
-  opts.deref_ref = 0;
+  opts.deref_ref = 1;
 
   const gdb_byte *valaddr = value_contents_for_printing (val);
   struct field *variant_field = rust_enum_variant (type, valaddr);

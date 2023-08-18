@@ -297,7 +297,7 @@ cp_print_value_fields (struct type *type, struct type *real_type,
 		{
 		  struct value_print_options opts = *options;
 
-		  opts.deref_ref = 0;
+		  opts.deref_ref = 1;
 
 		  v = value_field_bitfield (type, i, valaddr, offset, val);
 
@@ -352,7 +352,7 @@ cp_print_value_fields (struct type *type, struct type *real_type,
 		{
 		  struct value_print_options opts = *options;
 
-		  opts.deref_ref = 0;
+		  opts.deref_ref = 1;
 		  val_print (TYPE_FIELD_TYPE (type, i),
 			     offset + TYPE_FIELD_BITPOS (type, i) / 8,
 			     address,
@@ -694,7 +694,7 @@ cp_print_static_field (struct type *type,
     }
 
   opts = *options;
-  opts.deref_ref = 0;
+  opts.deref_ref = 1;
   val_print (type,
 	     value_embedded_offset (val),
 	     value_address (val),
